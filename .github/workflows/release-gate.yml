@@ -1,0 +1,108 @@
+name: Quality release gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build demo image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build image
+        run: docker build -t quality-release-demo:ci .
+
+      - name: Save image for the checks
+        run: docker save quality-release-demo:ci -o demo-image.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-image
+          path: demo-image.tar
+          retention-days: 1
+
+  playwright:
+    name: Playwright smoke test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install test dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: demo-image
+
+      - name: Load and start image
+        run: |
+          docker load -i demo-image.tar
+          docker run -d --name demo -p 3000:3000 quality-release-demo:ci
+
+      - name: Wait for the app
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://localhost:3000 > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs demo
+          exit 1
+
+      - name: Run Playwright
+        run: npx playwright test
+
+  trivy:
+    name: Trivy vulnerability scan
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: demo-image
+
+      - name: Load image
+        run: docker load -i demo-image.tar
+
+      - name: Scan for high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: quality-release-demo:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: table
+          output: trivy-report.txt
+
+      - name: Save scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.txt
+          if-no-files-found: warn
+
+  release:
+    name: Demonstration release
+    needs: [playwright, trivy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulate release
+        run: echo "Both checks passed. The release could proceed."
